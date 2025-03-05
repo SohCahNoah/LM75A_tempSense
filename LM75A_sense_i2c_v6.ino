@@ -1,19 +1,42 @@
 /**
 Author: Noah Roberts
-Last Update: 01/26/25
-Version Number: v5
+Last Update: 03/04/25
+Version Number: v6
 Purpose:  This code communicates with an LM75A temperature sensor over I2C.
           It also allows the user to communicate with the device in real time
-          via the serial terminal.
+          via the serial terminal. It also generates a PWM signal to control a
+          12V DC fan. When readTemperature() is called, the fan speed is automatically
+          set during this. When the sensed temp is at 25C or less, the PWM speed is
+          set to 0 (off) and when the sensed temp is at 50C or more, the  PWM speed is
+          set to 100 (full). Between these values the speed is linearly mapped between 25C and 50C
+          to 0% and 100%.
 
           Baud Rate to use: 9600
           I2C clock rate to use: 100kHz
 */
 
+// Pinout for breakout board is (looking at the input end, from left to right):
+// Pin 1 (Leftmost)   - System ground (common to both 12V source and Arduino GND, in order for correct reference point)
+// Pin 2              - Negative wire of fan
+// Pin 3              - (Unused)
+// Pin 4 (Rightmost)  - PWM signal from pin 9
+
+// Arduino Pinout
+// Pin 9 - Fan PWM output
+// SDA/SCL - LM75A sensor
+// Pin 13 - OS pin sensor
+// 5V vcc - Sensor power
+// Gnd - Common ground between all devices
+// Vin - Only used if supplying power from external source other than USB
+
 #include <Wire.h>
+#include <Arduino_LED_Matrix.h>
 
 byte temp_c; 
 byte temp_f;
+
+const int fanPin = 9;
+ArduinoLEDMatrix matrix;
 
 int outputFlag = 0;
 
@@ -24,11 +47,16 @@ int user_T_hyst = 29;
 //Loop delay time (ms)
 int loop_delay = 1000;
 
+uint8_t frame[8][12] = {0};
+
 void setup() {
   Serial.begin(9600);     //Initialize the Serial Output at 9600baud
   delay(1000);
   Wire.begin();           //Initialize the Arduino as a controller device
   Wire.setClock(100000);  //Set I2C clock to 100kHz (Standard Mode)
+
+  pinMode(fanPin, OUTPUT);
+  matrix.begin();
 
   Serial.println(F("\nInitializing..."));
   change_OS_temp(user_T_OS);  //Configure the T_os value for Overtemp alert on start-up
@@ -168,6 +196,29 @@ void processCommand(String command) {
       pauseOutput();
   } else if (command.startsWith("START")) {
       resumeOutput();
+
+  } else if (command.startsWith("SET_FAN")) {
+      String speedString = command.substring(8);
+      speedString.trim();
+
+      int equalsIndex = speedString.indexOf('=');
+      if (equalsIndex != -1) {
+        speedString = speedString.substring(equalsIndex + 1); // Take everything after the '='
+      }
+
+      // Convert to integer
+      int new_speed = speedString.toInt();
+
+      // Validate the hyst threshold value
+      if (new_speed >= 0 && new_speed <= 100) {
+        updateFan(new_speed);
+        Serial.println("Fan Speed set to: " + String(new_speed) + "%");
+        Serial.println("NOTICE: This speed is replaced automatically when active polling occurs or when GET_TEMP is called...");
+      } else {
+        Serial.println("Invalid speed. Enter a value between 0 and 100.");
+      }
+
+
   } else {
       Serial.print(F("Error - Unknown command: "));
       Serial.println(command);
@@ -188,6 +239,10 @@ void readTemperature() {
 
     int pinState = digitalRead(13);
     String pinStateStr = (pinState == HIGH) ? "LOW" : "HIGH"; //Device configured in Active-Low mode, so polarity on the terminal output is swapped for easy reading
+
+    // Map temperature to fan speed (0% at 25C, 100% at 50C)
+    int fanSpeed = (temp_c < 25) ? 0 : (temp_c > 50) ? 100 : map(temp_c, 25, 50, 0, 100);
+    updateFan(fanSpeed);
 
     Serial.print(F("Temperature: "));
     Serial.print(temp_c);
@@ -322,6 +377,7 @@ void printHelpMenu() {
   Serial.println(F("  PAUSE - Pauses temp polling until START command is typed in"));
   Serial.println(F("  START - Starts temp polling until PAUSE command is typed in"));
   Serial.println(F("  HELP - Output list of valid commands"));
+  Serial.println(F("  SET_FAN <value> - Manually set the fan speed to <value> (0 - 100)"));
   Serial.println(F("---------------------------------------------------------------\n"));  
 }
 
@@ -343,3 +399,19 @@ void pauseOutput() {
 void resumeOutput() {
   outputFlag = 1;
 }
+
+void setBinaryValue(int speed) {
+  int index = speed / 8.33; // Scale speed to fit 12 columns
+  for (int i = 0; i < 12; i++) {
+    for (int j = 0; j < 8; j++) {
+      frame[j][i] = (i <= index) ? 1 : 0;
+    }
+  }
+}
+
+void updateFan(int speed) {
+  int pwmValue = (speed == 0) ? 0 : map(speed, 1, 100, 1, 255);
+  analogWrite(fanPin, pwmValue);
+  setBinaryValue(speed);
+  matrix.renderBitmap(frame, 8, 12);
+} 
